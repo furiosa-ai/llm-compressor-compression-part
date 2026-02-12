@@ -11,7 +11,7 @@ from compressed_tensors.utils import patch_attr, remove_dispatch
 from huggingface_hub import snapshot_download
 from safetensors.torch import save_file
 from transformers import AutoModelForCausalLM, PreTrainedModel
-from transformers.modeling_utils import TORCH_INIT_FUNCTIONS
+# from transformers.modeling_utils import TORCH_INIT_FUNCTIONS
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME, WEIGHTS_INDEX_NAME
 
 __all__ = [
