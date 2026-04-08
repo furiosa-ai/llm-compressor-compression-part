@@ -25,6 +25,7 @@ from llmcompressor.modifiers import Modifier
 from llmcompressor.modifiers.quantization.calibration import update_weight_global_scale
 from llmcompressor.modifiers.quantization.gptq.gptq_quantize import (
     accumulate_hessian,
+    accumulate_imatrix,
     make_empty_hessian,
     quantize_weight,
 )
@@ -124,6 +125,7 @@ class GPTQModifier(Modifier, QuantizationMixin):
     # TODO: this does not serialize / will be incorrectly written
     actorder: Optional[Union[ActivationOrdering, Sentinel]] = Sentinel("static")
     offload_hessians: bool = False
+    use_importance_init: bool = False
 
     # private variables
     _module_names: Dict[torch.nn.Module, str] = PrivateAttr(default_factory=dict)
@@ -131,6 +133,7 @@ class GPTQModifier(Modifier, QuantizationMixin):
     _num_samples: Dict[torch.nn.Module, torch.Tensor] = PrivateAttr(
         default_factory=dict
     )
+    _imatrix: Dict[torch.nn.Module, torch.Tensor] = PrivateAttr(default_factory=dict)
 
     def resolve_quantization_config(self) -> QuantizationConfig:
         config = super().resolve_quantization_config()
@@ -249,7 +252,7 @@ class GPTQModifier(Modifier, QuantizationMixin):
         # Assume that first argument is the input
         inp = args[0]
 
-        # Initialize hessian if not present
+        # Initialize hessian (and optionally imatrix) if not present
         if module not in self._num_samples:
             init_device = (
                 "cpu" if self.offload_hessians else get_execution_device(module)
@@ -258,6 +261,15 @@ class GPTQModifier(Modifier, QuantizationMixin):
             self._num_samples[module] = torch.zeros(
                 tuple(), device=get_execution_device(module)
             )
+            # Pre-initialize imatrix to zeros so all DDP ranks have the same
+            # set of modules, avoiding collective operation mismatches
+            if self.use_importance_init:
+                num_columns = module.weight.shape[1]
+                self._imatrix[module] = torch.zeros(
+                    num_columns,
+                    device=get_execution_device(module),
+                    dtype=torch.float32,
+                )
 
         # Accumulate hessian with input with optional offloading
         with self._maybe_onload_hessian(module):
@@ -266,6 +278,12 @@ class GPTQModifier(Modifier, QuantizationMixin):
                 module,
                 self._hessians[module],
                 self._num_samples[module],
+            )
+
+        # Accumulate importance matrix if enabled
+        if self.use_importance_init:
+            self._imatrix[module] = accumulate_imatrix(
+                inp, module, self._imatrix.get(module)
             )
 
     def compress_modules(self):
@@ -302,7 +320,11 @@ class GPTQModifier(Modifier, QuantizationMixin):
             num_samples = self._num_samples[module]
             quant_args = getattr_chain(module, "quantization_scheme.weights")
 
-            logger.info(f"Quantizing {name} using {num_samples} samples")
+            # Get importance matrix if available
+            imatrix = self._imatrix.pop(module, None)
+
+            logger.info(f"Quantizing {name} using {num_samples} samples"
+                        f"{' (with importance init)' if imatrix is not None else ''}")
             with (
                 torch.no_grad(),
                 align_module_device(module),
@@ -315,6 +337,7 @@ class GPTQModifier(Modifier, QuantizationMixin):
                     hessian=self._hessians.pop(module) / self._num_samples.pop(module),
                     blocksize=self.block_size,
                     percdamp=self.dampening_frac,
+                    imatrix=imatrix,
                 )
                 comp_logger.set_loss(loss)
 
@@ -343,9 +366,20 @@ class GPTQModifier(Modifier, QuantizationMixin):
                         async_op=True,
                     )
                 )
+                # Reduce importance matrix across ranks
+                if module in self._imatrix:
+                    pending_comms.append(
+                        dist.reduce(
+                            self._imatrix[module],
+                            op=dist.ReduceOp.SUM,
+                            dst=target_rank,
+                            async_op=True,
+                        )
+                    )
                 if rank != target_rank:
                     self._hessians.pop(module, None)
                     self._num_samples.pop(module, None)
+                    self._imatrix.pop(module, None)
         wait_for_comms(pending_comms)
 
     def _broadcast_quantized_params(self, module_list, module_to_rank):
@@ -387,6 +421,7 @@ class GPTQModifier(Modifier, QuantizationMixin):
 
         self._hessians = dict()
         self._num_samples = dict()
+        self._imatrix = dict()
 
         return True
 

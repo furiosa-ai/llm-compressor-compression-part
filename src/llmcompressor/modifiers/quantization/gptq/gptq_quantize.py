@@ -18,7 +18,13 @@ from llmcompressor.pytorch.utils.helpers import tensor_sparsity
 
 GPTQ_PRECISION = torch.float32
 
-__all__ = ["make_empty_hessian", "accumulate_hessian", "quantize_weight"]
+__all__ = [
+    "make_empty_hessian",
+    "accumulate_hessian",
+    "accumulate_imatrix",
+    "refine_scale_with_importance",
+    "quantize_weight",
+]
 
 
 def make_empty_hessian(
@@ -67,22 +73,170 @@ def accumulate_hessian(
     return H, num_samples
 
 
+def accumulate_imatrix(
+    inp: torch.Tensor,
+    module: torch.nn.Module,
+    imatrix: torch.Tensor | None,
+) -> torch.Tensor:
+    """
+    Accumulate importance matrix: channel-wise sum of squared input activations.
+    Inspired by SignRound V2 / llama.cpp importance matrix.
+
+    :param inp: input activation tensor
+    :param module: module being calibrated
+    :param imatrix: existing importance matrix to accumulate into, or None
+    :return: updated importance matrix of shape (num_input_channels,)
+    """
+    if len(inp.shape) == 2:
+        inp = inp.unsqueeze(0)
+
+    # Handle different module types (mirror accumulate_hessian)
+    match module:
+        case torch.nn.Linear() | transformers.Conv1D():
+            if len(inp.shape) == 3:
+                inp = inp.reshape((-1, inp.shape[-1]))
+        case torch.nn.Conv2d():
+            unfold = torch.nn.Unfold(
+                module.kernel_size,
+                dilation=module.dilation,
+                padding=module.padding,
+                stride=module.stride,
+            )
+            inp = unfold(inp)
+            inp = inp.permute([1, 0, 2]).flatten(1).t()
+
+    inp = inp.to(dtype=GPTQ_PRECISION)
+
+    # Sum of squares per input channel
+    squared = torch.sum(inp**2, dim=0)
+
+    if imatrix is None:
+        return squared
+    else:
+        return imatrix + squared.to(imatrix.device)
+
+
+def refine_scale_with_importance(
+    W: torch.Tensor,
+    scale: torch.Tensor,
+    zero_point: torch.Tensor,
+    quant_args: QuantizationArgs,
+    imatrix: torch.Tensor,
+    global_scale: torch.Tensor | None = None,
+    search_range: tuple[float, float] = (0.5, 1.5),
+    search_step: float = 0.01,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Refine quantization scale using importance-weighted grid search.
+    Inspired by SignRound V2's scale initialization with importance matrix.
+
+    For each group, searches over scale multipliers in [search_range[0], search_range[1]]
+    to minimize importance-weighted quantization error.
+
+    :param W: weight tensor (num_rows, num_columns) in GPTQ_PRECISION
+    :param scale: initial scale from observer
+    :param zero_point: initial zero point from observer
+    :param quant_args: quantization arguments
+    :param imatrix: importance matrix of shape (num_columns,)
+    :param global_scale: optional global scale for TENSOR_GROUP strategy
+    :param search_range: (min_factor, max_factor) for grid search
+    :param search_step: step size for grid search
+    :return: refined (scale, zero_point)
+    """
+    strategy = quant_args.strategy
+    group_size = quant_args.group_size
+
+    if strategy not in (QuantizationStrategy.GROUP, QuantizationStrategy.TENSOR_GROUP):
+        return scale, zero_point
+
+    if group_size is None or group_size <= 0:
+        return scale, zero_point
+
+    if not quant_args.symmetric:
+        logger.warning(
+            "refine_scale_with_importance: asymmetric quantization requires "
+            "zero_point recomputation; skipping refinement"
+        )
+        return scale, zero_point
+
+    # Ensure imatrix is on the same device as W
+    imatrix = imatrix.to(device=W.device)
+
+    num_rows, num_columns = W.shape
+    num_groups = num_columns // group_size
+    if num_groups == 0:
+        return scale, zero_point
+
+    effective_cols = num_groups * group_size
+
+    # Reshape weight and importance into groups
+    W_g = W[:, :effective_cols].reshape(num_rows, num_groups, group_size).float()
+    imatrix_g = imatrix[:effective_cols].reshape(1, num_groups, group_size).float()
+
+    # Normalize importance to avoid numerical issues
+    imatrix_max = imatrix_g.amax(dim=-1, keepdim=True).clamp(min=1e-8)
+    imatrix_g = imatrix_g / imatrix_max
+
+    # Compute initial importance-weighted quantization error
+    W_q_init = fake_quantize(
+        W, scale, zero_point, quant_args, global_scale=global_scale
+    )
+    W_q_g = W_q_init[:, :effective_cols].reshape(num_rows, num_groups, group_size).float()
+    init_loss = ((W_g - W_q_g) ** 2 * imatrix_g).sum(dim=-1).sum(dim=0)  # (num_groups,)
+    best_loss = init_loss.clone()
+
+    best_scale = scale.clone()
+
+    # Grid search over multiplicative factors
+    factor = search_range[0]
+    while factor <= search_range[1] + 1e-9:
+        if abs(factor - 1.0) < 1e-9:
+            factor += search_step
+            continue
+
+        candidate_scale = scale * factor
+        W_q = fake_quantize(
+            W, candidate_scale, zero_point, quant_args, global_scale=global_scale
+        )
+        W_q_g = W_q[:, :effective_cols].reshape(num_rows, num_groups, group_size).float()
+        loss = ((W_g - W_q_g) ** 2 * imatrix_g).sum(dim=-1).sum(dim=0)  # (num_groups,)
+
+        improved = loss < best_loss
+        if improved.any():
+            best_scale[:, improved] = candidate_scale[:, improved]
+            best_loss[improved] = loss[improved]
+
+        factor += search_step
+
+    num_improved = (best_loss < init_loss).sum().item()
+    logger.info(
+        f"  Scale refinement: groups improved {num_improved}/{num_groups}"
+    )
+
+    return best_scale, zero_point
+
+
 def quantize_weight(
     module: torch.nn.Module,
     quant_args: QuantizationArgs,
     hessian: torch.Tensor,
     blocksize: int = 128,
     percdamp: float = 0.01,
-) -> tuple[float, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor]:
+    imatrix: torch.Tensor | None = None,
+) -> tuple[float, dict]:
     """
     Quantize a module weight according to the GPTQ algorithm
 
     :param module: module with weight being quantized
     :param quant_args: quantization arguments used to find quantization parameters
-    :param hessian_dict: dictionary containing preaccumulated hessian for quantization
+    :param hessian: preaccumulated hessian for quantization
     :param blocksize: chunk size of quantization updates
     :param percdamp: dampening factor on hessian diagonal
-    :return: loss, quantized_weight, scale, zero_point, g_idx
+    :param imatrix: optional importance matrix (channel-wise sum of squared activations)
+        for importance-weighted scale initialization. If provided, scale is refined
+        using grid search before the GPTQ weight update loop.
+    :return: tuple of (loss, q_param_dict) where q_param_dict contains
+        weight, weight_scale, weight_zero_point, and optionally weight_g_idx
     """
     strategy = quant_args.strategy
     actorder = quant_args.actorder
@@ -121,14 +275,24 @@ def quantize_weight(
         if actorder == ActivationOrdering.GROUP:
             # permute by activation order first, then update groups
             W, H, perm = _apply_activation_ordering(W, H)
+            if imatrix is not None:
+                imatrix = imatrix[perm]
             update_offload_parameter(module, "weight_g_idx", g_idx)
             scale, zero_point = observer(W)
+            if imatrix is not None:
+                scale, zero_point = refine_scale_with_importance(
+                    W, scale, zero_point, quant_args, imatrix, global_scale
+                )
 
             # use identity g_idx (invert permutation later)
 
         elif actorder == ActivationOrdering.WEIGHT:
             # update groups first, then permute by activation order
             scale, zero_point = observer(W)
+            if imatrix is not None:
+                scale, zero_point = refine_scale_with_importance(
+                    W, scale, zero_point, quant_args, imatrix, global_scale
+                )
             W, H, perm = _apply_activation_ordering(W, H)
 
             # permute g_idx to maintain identity mapping after unpermutation
@@ -136,6 +300,10 @@ def quantize_weight(
 
         else:
             scale, zero_point = observer(W)
+            if imatrix is not None:
+                scale, zero_point = refine_scale_with_importance(
+                    W, scale, zero_point, quant_args, imatrix, global_scale
+                )
     else:
         scale, zero_point = observer(W)
 
