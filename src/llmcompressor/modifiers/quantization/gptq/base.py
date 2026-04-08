@@ -155,11 +155,25 @@ class GPTQModifier(Modifier, QuantizationMixin):
 
         for scheme in config.config_groups.values():
             assert isinstance(scheme, QuantizationScheme)
-            if (
-                getattr_chain(scheme, "weights.strategy", None)
-                == QuantizationStrategy.GROUP
-            ):
+            strategy = getattr_chain(scheme, "weights.strategy", None)
+            if strategy == QuantizationStrategy.GROUP:
                 scheme.weights.actorder = resolve_actorder(scheme.weights.actorder)
+            elif strategy == QuantizationStrategy.TENSOR_GROUP:
+                # TENSOR_GROUP supports WEIGHT(=STATIC) actorder only.
+                # GROUP(=DYNAMIC) actorder requires g_idx at inference, which
+                # is not supported by the FP4 compressor or vLLM FP4 kernels.
+                # Only apply actorder when user explicitly requests it
+                # (not via sentinel default) to avoid breaking existing behavior.
+                if self.actorder != Sentinel("static"):
+                    resolved = resolve_actorder(scheme.weights.actorder)
+                    if resolved == ActivationOrdering.GROUP:
+                        logger.warning(
+                            "GROUP(=DYNAMIC) actorder is not supported for "
+                            "TENSOR_GROUP strategy (FP4 compressor lacks g_idx "
+                            "support). Falling back to WEIGHT(=STATIC) actorder."
+                        )
+                        resolved = ActivationOrdering.WEIGHT
+                    scheme.weights.actorder = resolved
         return config
 
     def on_initialize(self, state: State, **kwargs) -> bool:
