@@ -195,7 +195,7 @@ def _grid_search_mse(
         shrinked_max_val = p * max_val
 
         if optimize_global_scale:
-            global_scale = generate_gparam(shrinked_min_val, shrinked_max_val)
+            global_scale = generate_gparam(shrinked_min_val, shrinked_max_val, num_bits=args.num_bits)
 
         candidate_scales, candidate_zero_points = calculate_qparams(
             min_vals=shrinked_min_val,

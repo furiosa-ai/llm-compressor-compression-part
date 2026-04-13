@@ -122,7 +122,7 @@ class Observer(InternalModule, RegistryMixin):
         observed = observed.reshape((1, 1, -1))  # per tensor reshape
 
         global_min_vals, global_max_vals = self.get_global_min_max(observed)
-        global_scale = generate_gparam(global_min_vals, global_max_vals)
+        global_scale = generate_gparam(global_min_vals, global_max_vals, num_bits=self.args.num_bits)
 
         return global_scale, global_min_vals, global_max_vals
 
