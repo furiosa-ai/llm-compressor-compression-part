@@ -5,6 +5,7 @@ from weakref import ref
 import torch
 from compressed_tensors import InternalModule
 from compressed_tensors.quantization import QuantizationArgs, QuantizationStrategy
+from compressed_tensors.quantization.quant_args import FP8_E4M3_DATA, FP4_E2M1_DATA
 from compressed_tensors.quantization.utils import calculate_qparams, generate_gparam
 from compressed_tensors.registry.registry import RegistryMixin
 from compressed_tensors.utils import align_module_device
@@ -122,7 +123,8 @@ class Observer(InternalModule, RegistryMixin):
         observed = observed.reshape((1, 1, -1))  # per tensor reshape
 
         global_min_vals, global_max_vals = self.get_global_min_max(observed)
-        global_scale = generate_gparam(global_min_vals, global_max_vals, num_bits=self.args.num_bits)
+        quant_data = FP8_E4M3_DATA if self.args.num_bits == 8 else FP4_E2M1_DATA
+        global_scale = generate_gparam(global_min_vals, global_max_vals, quant_data=quant_data)
 
         return global_scale, global_min_vals, global_max_vals
 

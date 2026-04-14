@@ -6,6 +6,7 @@ from compressed_tensors.quantization import (
     QuantizationStrategy,
 )
 from compressed_tensors.quantization.lifecycle import fake_quantize
+from compressed_tensors.quantization.quant_args import FP8_E4M3_DATA, FP4_E2M1_DATA
 from compressed_tensors.quantization.utils import calculate_qparams, generate_gparam
 from compressed_tensors.utils import patch_attr
 
@@ -195,7 +196,8 @@ def _grid_search_mse(
         shrinked_max_val = p * max_val
 
         if optimize_global_scale:
-            global_scale = generate_gparam(shrinked_min_val, shrinked_max_val, num_bits=args.num_bits)
+            quant_data = FP8_E4M3_DATA if args.num_bits == 8 else FP4_E2M1_DATA
+            global_scale = generate_gparam(shrinked_min_val, shrinked_max_val, quant_data=quant_data)
 
         candidate_scales, candidate_zero_points = calculate_qparams(
             min_vals=shrinked_min_val,
