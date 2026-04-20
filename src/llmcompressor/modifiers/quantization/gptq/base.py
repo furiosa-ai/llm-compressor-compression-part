@@ -53,6 +53,7 @@ class GPTQModifier(Modifier, QuantizationMixin):
         GPTQModifier:
           block_size: 128
           dampening_frac: 0.001
+          foem_beta: 0.0
           offload_hessians: False
           actorder: static
           config_groups:
@@ -87,6 +88,14 @@ class GPTQModifier(Modifier, QuantizationMixin):
     :param block_size: Used to determine number of columns to compress in one pass
     :param dampening_frac: Amount of dampening to apply to H, as a fraction of the
         diagonal norm
+    :param foem_beta: FOEM (First-Order Error Matters, AAAI 2026) first-order
+        correction coefficient. When > 0, a term
+        ``-(W - fp_weight) @ (Hinv.T @ Hinv) * foem_beta`` is added to the GPTQ
+        weight update, pulling remaining columns toward the original FP weights.
+        Setting ``foem_beta=0`` (default) recovers the unmodified GPTQ update,
+        so the baseline behavior is preserved. Typical LLM values: 1e-4 – 3e-4.
+        Note: enabling FOEM clones the layer's FP weight during quantization,
+        which roughly doubles peak memory for the layer being quantized.
     :param actorder: order in which weight columns are quantized. Defaults to "static"
         activation ordering, which achieves best accuracy recovery with no runtime cost.
         For more information, see https://github.com/vllm-project/vllm/pull/8135
@@ -121,6 +130,7 @@ class GPTQModifier(Modifier, QuantizationMixin):
     sequential_targets: Union[str, List[str], None] = None
     block_size: int = 128
     dampening_frac: Optional[float] = 0.01
+    foem_beta: Optional[float] = 0.0
     # TODO: this does not serialize / will be incorrectly written
     actorder: Optional[Union[ActivationOrdering, Sentinel]] = Sentinel("static")
     offload_hessians: bool = False
@@ -315,6 +325,7 @@ class GPTQModifier(Modifier, QuantizationMixin):
                     hessian=self._hessians.pop(module) / self._num_samples.pop(module),
                     blocksize=self.block_size,
                     percdamp=self.dampening_frac,
+                    foem_beta=(self.foem_beta or 0.0),
                 )
                 comp_logger.set_loss(loss)
 

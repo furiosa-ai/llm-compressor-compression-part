@@ -73,6 +73,7 @@ def quantize_weight(
     hessian: torch.Tensor,
     blocksize: int = 128,
     percdamp: float = 0.01,
+    foem_beta: float = 0.0,
 ) -> tuple[float, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor]:
     """
     Quantize a module weight according to the GPTQ algorithm
@@ -82,6 +83,12 @@ def quantize_weight(
     :param hessian_dict: dictionary containing preaccumulated hessian for quantization
     :param blocksize: chunk size of quantization updates
     :param percdamp: dampening factor on hessian diagonal
+    :param foem_beta: FOEM (First-Order Error Matters, AAAI 2026) first-order
+        correction coefficient. When > 0, an extra term
+        ``-(W - fp_weight) @ (Hinv.T @ Hinv) * foem_beta`` is applied during
+        error propagation, pulling remaining columns toward the original FP
+        weights via the inverse-Hessian block. Set to 0 (default) to recover
+        the unmodified GPTQ update. Typical LLM values: 1e-4 – 3e-4.
     :return: loss, quantized_weight, scale, zero_point, g_idx
     """
     strategy = quant_args.strategy
@@ -106,6 +113,12 @@ def quantize_weight(
             W = W.flatten(1)
         case transformers.Conv1D():
             W.transpose_(0, 1)
+    # FOEM: clone the reference FP weights BEFORE the fp32 cast so fp_weight
+    # stays in the original (bf16/fp16) dtype — ~half the memory of a fp32
+    # clone. It's implicitly promoted to fp32 during the FOEM subtraction,
+    # and since bf16/fp16 values are exactly representable in fp32 this is
+    # arithmetically identical to cloning after the cast.
+    fp_weight = W.clone() if foem_beta > 0 else None
     W = W.to(dtype=GPTQ_PRECISION)
     num_rows = W.shape[0]
     num_columns = W.shape[1]
@@ -121,6 +134,8 @@ def quantize_weight(
         if actorder == ActivationOrdering.GROUP:
             # permute by activation order first, then update groups
             W, H, perm = _apply_activation_ordering(W, H)
+            if fp_weight is not None:
+                fp_weight = fp_weight[:, perm]
             update_offload_parameter(module, "weight_g_idx", g_idx)
             scale, zero_point = observer(W)
 
@@ -130,6 +145,8 @@ def quantize_weight(
             # update groups first, then permute by activation order
             scale, zero_point = observer(W)
             W, H, perm = _apply_activation_ordering(W, H)
+            if fp_weight is not None:
+                fp_weight = fp_weight[:, perm]
 
             # permute g_idx to maintain identity mapping after unpermutation
             g_idx = g_idx[perm]
@@ -183,6 +200,8 @@ def quantize_weight(
         Err1 = torch.zeros_like(W1)
         losses1 = torch.zeros_like(W1)
         Hinv1 = Hinv[i1:i2, i1:i2]
+
+        fp_weight1 = fp_weight[:, i1:i2] if fp_weight is not None else None
 
         if preserve_zeros:
             W1_nz_mask = W_nz_mask[:, i1:i2]
@@ -241,6 +260,20 @@ def quantize_weight(
                 W1[:, i:] -= w1_err * W1_nz_mask[:, i:]
             else:
                 W1[:, i:] -= w1_err
+
+            # FOEM first-order correction (per-column update)
+            if fp_weight1 is not None:
+                Hinv_tail = Hinv1[i:, i:]
+                foem_update = (
+                    (W1[:, i:] - fp_weight1[:, i:])
+                    @ (Hinv_tail.t() @ Hinv_tail)
+                    * foem_beta
+                )
+                if preserve_zeros:
+                    W1[:, i:] -= foem_update * W1_nz_mask[:, i:]
+                else:
+                    W1[:, i:] -= foem_update
+
             Err1[:, i] = err1
 
         # propagate block error
@@ -252,6 +285,19 @@ def quantize_weight(
             W[:, i2:] -= w_err * W_nz_mask[:, i2:]
         else:
             W[:, i2:] -= w_err
+
+        # FOEM first-order correction (inter-block update)
+        if fp_weight is not None and i2 < num_columns:
+            Hinv_tail_block = Hinv[i2:, i2:]
+            foem_block_update = (
+                (W[:, i2:] - fp_weight[:, i2:])
+                @ (Hinv_tail_block.t() @ Hinv_tail_block)
+                * foem_beta
+            )
+            if preserve_zeros:
+                W[:, i2:] -= foem_block_update * W_nz_mask[:, i2:]
+            else:
+                W[:, i2:] -= foem_block_update
 
     has_gidx = False
     if strategy in (QuantizationStrategy.GROUP, QuantizationStrategy.TENSOR_GROUP):
