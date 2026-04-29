@@ -89,6 +89,18 @@ def modify_save_pretrained(model: PreTrainedModel):
             to_accelerate(model)
 
             if is_rank0():
+                # Pass an explicit `state_dict` so transformers' save_pretrained
+                # bypasses its offloaded-save module_map path. That path keys
+                # state_dict tensors by the module names returned by
+                # named_modules(), and fails with `KeyError: '<param_name>'`
+                # for top-level Parameters that aren't owned by a submodule
+                # (e.g. CLIPModel.logit_scale). At this point compress_model
+                # has already replaced quantized weights with their compressed
+                # form, so model.state_dict() returns the right values.
+                if "state_dict" not in kwargs:
+                    kwargs = dict(kwargs)
+                    kwargs["state_dict"] = model.state_dict()
+
                 # save (compressed) model structure
                 original_save_pretrained.__get__(model, model_class)(
                     save_directory,
