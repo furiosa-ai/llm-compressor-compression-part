@@ -198,8 +198,19 @@ def calibrate_input_hook(module: Module, args: Any):
     Hook to calibrate input activations.
     Will call the observers to update the scales/zp before applying
     input QDQ in the module's forward pass.
+
+    Note on SmoothQuant non-fused (o_proj / down_proj): when a `smooth_scale`
+    buffer is attached, the runtime forward divides the input by it before
+    quantization. The static `input_global_scale` observer must see that same
+    smoothed distribution, otherwise it gets calibrated on the un-smoothed
+    activation and the saved scale mismatches the inference-time activation
+    range — observed as a 6-7x KL regression on Llama-3.2-3B SMQ. Apply the
+    same divisor here before the observer call.
     """
     args = args[0] if isinstance(args, tuple) else args
+    smooth_scale = getattr(module, "smooth_scale", None)
+    if smooth_scale is not None:
+        args = args / smooth_scale.to(dtype=args.dtype, device=args.device)
     calibrate_activations(module, value=args, base_name="input")
 
 

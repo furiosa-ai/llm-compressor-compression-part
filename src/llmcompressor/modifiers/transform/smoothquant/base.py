@@ -15,6 +15,7 @@ from llmcompressor.core import Event, EventType, State
 from llmcompressor.modifiers import Modifier
 from llmcompressor.modifiers.transform.smoothquant.utils import (
     get_layer_mappings_from_architecture,
+    get_nonfused_smooth_layers,
     handle_mapping_resolution_errors,
 )
 from llmcompressor.utils.dist import wait_for_comms
@@ -101,6 +102,7 @@ class SmoothQuantModifier(Modifier):
 
     smoothing_strength: float = 0.5
     mappings: list[tuple | list] | None = None
+    nonfused_smooth_layers: list[str] | None = None
     ignore: list[str] | None = None
     num_calibration_steps: int | None = None
     calibration_function: Callable | None = None
@@ -109,6 +111,10 @@ class SmoothQuantModifier(Modifier):
         default=None, repr=False
     )
     scales_: dict | None = Field(default=None, repr=False)
+    # Non-fused (o_proj / down_proj): captured per-channel abs-max of inputs.
+    # Keyed by full module name. Cleared after _apply_smoothing.
+    nonfused_resolved_: list[tuple] | None = Field(default=None, repr=False)
+    nonfused_scales_: dict | None = Field(default=None, repr=False)
 
     def on_initialize(self, state: State, **kwargs) -> bool:
         """
@@ -137,6 +143,16 @@ class SmoothQuantModifier(Modifier):
         self.mappings = self._infer_mappings_from_model(state.model)
         self.resolved_mappings_ = self._resolve_mappings(state.model)
         self.scales_ = {}
+
+        # Non-fused: o_proj / down_proj have no preceding LN. We hook on the
+        # Linear's INPUT and apply migration via a per-channel divisor stored
+        # as a persistent buffer that compressed-tensors picks up at runtime.
+        if self.nonfused_smooth_layers is None:
+            self.nonfused_smooth_layers = get_nonfused_smooth_layers(
+                state.model.__class__.__name__
+            )
+        self.nonfused_resolved_ = self._resolve_nonfused(state.model)
+        self.nonfused_scales_ = {}
 
         return True
 
@@ -176,6 +192,10 @@ class SmoothQuantModifier(Modifier):
             self.scales_.clear()
         if self.resolved_mappings_ is not None:
             self.resolved_mappings_.clear()
+        if self.nonfused_scales_ is not None:
+            self.nonfused_scales_.clear()
+        if self.nonfused_resolved_ is not None:
+            self.nonfused_resolved_.clear()
 
         return True
 
@@ -257,6 +277,29 @@ class SmoothQuantModifier(Modifier):
 
         return resolved_mappings
 
+    def _resolve_nonfused(self, model: Module) -> list[tuple]:
+        """Resolve regexes in ``nonfused_smooth_layers`` to (name, module) pairs.
+
+        These are Linear layers (typically o_proj, down_proj) with no preceding
+        LayerNorm to fuse the migration scale into. Calibration captures their
+        INPUTs and apply-time stashes a per-channel divisor as a persistent
+        ``smooth_scale`` buffer; compressed-tensors' quantized_forward divides
+        the input by it before the activation observer / quantization runs.
+        """
+        if not self.nonfused_smooth_layers:
+            return []
+        resolved: list[tuple] = []
+        for name, module in match_named_modules(model, self.nonfused_smooth_layers):
+            if not isinstance(module, torch.nn.Linear):
+                continue
+            resolved.append((name, module))
+        if resolved:
+            logger.info(
+                f"SmoothQuant non-fused targets ({len(resolved)}): "
+                f"{[n for n, _ in resolved[:4]]}{'...' if len(resolved) > 4 else ''}"
+            )
+        return resolved
+
     def _setup_scale_hooks(self):
         """
         Attach a forward hook to each activation we want to smooth. This allows us to
@@ -292,6 +335,25 @@ class SmoothQuantModifier(Modifier):
             name = mapping.smooth_name
             layer = mapping.smooth_layer
             self.register_hook(layer, create_hook_fn(name), "forward")
+
+        # Non-fused: capture the per-channel abs-max of the Linear's INPUT.
+        # Forward pre-hook sees the input tuple before the linear runs, which
+        # for o_proj / down_proj is exactly the activation we want to smooth.
+        def create_input_absmax_hook(layer_name):
+            def hook_fn(module, inp):
+                x = inp[0] if isinstance(inp, tuple) else inp
+                x = x.detach()
+                hidden = x.shape[-1]
+                cur = x.abs().reshape(-1, hidden).amax(dim=0)
+                prev = self.nonfused_scales_.get(layer_name)
+                self.nonfused_scales_[layer_name] = (
+                    cur if prev is None else torch.maximum(prev, cur)
+                )
+
+            return hook_fn
+
+        for name, layer in self.nonfused_resolved_:
+            self.register_hook(layer, create_input_absmax_hook(name), "forward_pre")
 
     def _reduce_activation_scales(self):
         """
@@ -351,10 +413,13 @@ class SmoothQuantModifier(Modifier):
                 continue
             logger.info(f"Smoothing with {mapping.smooth_name}")
 
-            activation_scales = (  # get dynamic range for each activation channel
-                self.scales_[mapping.smooth_name].max_channel_vals
-                - self.scales_[mapping.smooth_name].min_channel_vals
-            )
+            # Paper-faithful per-channel abs-max (matches INT_vs_FP reference).
+            # Was `max - min` (signed dynamic range), which is up to 2x more
+            # aggressive on symmetric outliers and biases the migration in
+            # asymmetric channels. See SMQ_REPO_DIFF.md §2.
+            max_abs = self.scales_[mapping.smooth_name].max_channel_vals.abs()
+            min_abs = self.scales_[mapping.smooth_name].min_channel_vals.abs()
+            activation_scales = torch.maximum(max_abs, min_abs)
             smooth_layer = mapping.smooth_layer
             balance_layers = mapping.balance_layers
 
@@ -389,6 +454,36 @@ class SmoothQuantModifier(Modifier):
             # clear calibration data
             del self.scales_[mapping.smooth_name]
 
+        # ---- Non-fused: o_proj / down_proj ----
+        # Pre-multiply weights by per-input-channel scale and stash the divisor
+        # as a persistent buffer so compressed-tensors' quantized_forward picks
+        # it up at runtime (and at inference after save/load).
+        for name, module in self.nonfused_resolved_:
+            if name not in self.nonfused_scales_:
+                continue
+            logger.info(f"Smoothing (non-fused) {name}")
+            a = self.nonfused_scales_[name].to(
+                device=module.weight.device, dtype=torch.float32
+            )
+            scales = self._calculate_smoothing_scales([module], a)
+            scales = torch.maximum(
+                scales,
+                torch.tensor([MINIMUM_SMOOTHING_SCALE], device=scales.device),
+            )
+            scales_w = scales.to(module.weight.dtype)
+            update_offload_parameter(
+                module, "weight", module.weight * scales_w.view(1, -1)
+            )
+            # Persistent buffer so it survives save_pretrained / from_pretrained.
+            # If a stale buffer exists from a previous run, overwrite it.
+            if hasattr(module, "smooth_scale") and module.smooth_scale is not None:
+                module.smooth_scale = scales_w.detach().clone()
+            else:
+                module.register_buffer(
+                    "smooth_scale", scales_w.detach().clone(), persistent=True
+                )
+            del self.nonfused_scales_[name]
+
     def _calculate_smoothing_scales(
         self, balance_layers: list[Module], activation_scales: torch.Tensor
     ) -> torch.Tensor:
@@ -406,7 +501,9 @@ class SmoothQuantModifier(Modifier):
             scale = layer.weight.abs().max(dim=0, keepdim=True)[0]
             weight_scales.append(scale)
 
-        weight_scales = 2.0 * torch.cat(weight_scales, dim=0).max(dim=0)[0]
+        # Paper-faithful: max(|W|) without the unexplained 2.0x factor
+        # (matches INT_vs_FP reference). See SMQ_REPO_DIFF.md §3.
+        weight_scales = torch.cat(weight_scales, dim=0).max(dim=0)[0]
 
         # calculate the amount of smoothing to apply
         # s_j = max(|X_j|)^alpha / max(|W_j|)^(1-alpha)

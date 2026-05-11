@@ -5,8 +5,11 @@ from loguru import logger
 
 __all__ = [
     "get_layer_mappings_from_architecture",
+    "get_nonfused_smooth_layers",
     "MAPPINGS_REGISTRY",
+    "NONFUSED_SMOOTH_REGISTRY",
     "DEFAULT_SMOOTHQUANT_MAPPINGS",
+    "DEFAULT_NONFUSED_SMOOTH_LAYERS",
 ]
 
 LayerMapType = tuple[list[str], str]
@@ -81,6 +84,33 @@ AFMOE_SMOOTHQUANT_MAPPINGS: list[LayerMap] = [
         smooth_layers="re:.*pre_mlp_layernorm",
     ),
 ]
+
+
+# Linear layers to self-smooth ("non-fused"): no preceding LayerNorm to absorb
+# the migration scale into. Calibration captures their INPUT activations and
+# applies migration via a per-input-channel divisor stored as a persistent
+# `smooth_scale` buffer on the module; compressed-tensors' quantized_forward
+# divides the input by it before activation quantization. Mirrors the
+# `_smooth_linear_output` path in INT_vs_FP/quant/smoothquant.py.
+DEFAULT_NONFUSED_SMOOTH_LAYERS: list[str] = [
+    "re:.*self_attn\\.o_proj$",
+    "re:.*mlp\\.down_proj$",
+]
+
+NONFUSED_SMOOTH_REGISTRY: dict[str, list[str]] = {
+    "Gemma2ForCausalLM": DEFAULT_NONFUSED_SMOOTH_LAYERS,
+    "Gemma3ForCausalLM": DEFAULT_NONFUSED_SMOOTH_LAYERS,
+    "LlamaForCausalLM": DEFAULT_NONFUSED_SMOOTH_LAYERS,
+    "MistralForCausalLM": DEFAULT_NONFUSED_SMOOTH_LAYERS,
+    "Qwen2ForCausalLM": DEFAULT_NONFUSED_SMOOTH_LAYERS,
+    "Qwen3ForCausalLM": DEFAULT_NONFUSED_SMOOTH_LAYERS,
+}
+
+
+def get_nonfused_smooth_layers(architecture: str) -> list[str]:
+    """Per-architecture list of regexes for Linear layers to self-smooth
+    (no preceding LayerNorm). Returns [] when architecture is unknown."""
+    return NONFUSED_SMOOTH_REGISTRY.get(architecture, [])
 
 
 # Registry of layer mappings for different architectures
