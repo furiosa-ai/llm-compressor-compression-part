@@ -16,7 +16,13 @@ from abc import ABC
 
 import torch
 import torch.distributed as dist
-from compressed_tensors.offload import is_distributed
+from compressed_tensors.offload import (
+    get_execution_device,
+    get_offloaded_device,
+    is_distributed,
+    offload_module,
+)
+from compressed_tensors.offload.cache import OffloadCache
 from compressed_tensors.registry import RegistryMixin, standardize_lookup_name
 from loguru import logger
 from tqdm import tqdm
@@ -59,6 +65,76 @@ class MoECalibrationModule(ABC, torch.nn.Module, RegistryMixin):
             f"{self.__class__.__name__} has is_permanent=False but doesn't "
             "implement restore()"
         )
+
+
+def _find_ancestor_with_offload_cache(module: torch.nn.Module):
+    """
+    Recursively search a module (and its descendants) for the first module whose
+    parameters are managed by an ``OffloadCache``.
+
+    :param module: module to search
+    :return: the first offloaded module found, or ``None``
+    """
+    if isinstance(module._parameters, OffloadCache):
+        return module
+
+    for child in module.children():
+        found = _find_ancestor_with_offload_cache(child)
+        if found is not None:
+            return found
+
+    return None
+
+
+def _get_cache_init_kwargs(module_with_cache: torch.nn.Module) -> dict:
+    """
+    Extract the kwargs needed to offload another module with the same settings as
+    ``module_with_cache``. Mirrors ``compressed_tensors.offload.get_cache_init_kwargs``
+    (not present in the pinned compressed-tensors), reusing the exported
+    ``get_execution_device`` / ``get_offloaded_device`` helpers.
+
+    :param module_with_cache: a module whose ``_parameters`` is an ``OffloadCache``
+    :return: kwargs for ``offload_module`` (onload/offload device, +offload_dir if disk)
+    """
+    cache = module_with_cache._parameters
+    kwargs = {
+        "onload_device": get_execution_device(module_with_cache),
+        "offload_device": get_offloaded_device(module_with_cache),
+    }
+    if hasattr(cache, "offload_dir"):
+        kwargs["offload_dir"] = cache.offload_dir
+    return kwargs
+
+
+def _apply_offloading_to_replacement(
+    original: torch.nn.Module, replacement: torch.nn.Module
+):
+    """
+    Apply the same offloading configuration from ``original`` to ``replacement``.
+
+    If the original module (or any of its children) uses an ``OffloadCache``, every
+    submodule of ``replacement`` that holds its own parameters and is not already
+    offloaded is offloaded with the same settings. In a distributed run this routes
+    freshly-materialized weights (e.g. unfused MoE experts) into shared ``/dev/shm``
+    memory via ``DistributedCPUCache`` instead of leaving a private per-rank copy.
+
+    :param original: the module being replaced (source of offload settings)
+    :param replacement: the calibration module that replaces it (offloaded in place)
+    """
+    module_with_cache = _find_ancestor_with_offload_cache(original)
+    if module_with_cache is None:
+        return
+
+    kwargs = _get_cache_init_kwargs(module_with_cache)
+
+    # Offload all submodules that own parameters and are not already offloaded
+    for module in replacement.modules():
+        if isinstance(module._parameters, OffloadCache):
+            continue
+        if len(list(module.parameters(recurse=False))) == 0:
+            continue
+
+        offload_module(module, **kwargs)
 
 
 @contextlib.contextmanager
@@ -112,6 +188,10 @@ def moe_calibration_context(
                 calibrate_all_experts=calibrate_all_experts,
             )
             model.set_submodule(name, replacement)
+            # Offload newly-materialized weights with the same settings as the
+            # original (shared /dev/shm in distributed runs) so unfused experts
+            # are not duplicated per-rank. See _apply_offloading_to_replacement.
+            _apply_offloading_to_replacement(module, replacement)
             replaced[name] = (module, replacement)
             if is_distributed():
                 dist.barrier()
