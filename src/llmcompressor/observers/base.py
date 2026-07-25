@@ -6,7 +6,11 @@ import torch
 from compressed_tensors import InternalModule
 from compressed_tensors.quantization import QuantizationArgs, QuantizationStrategy
 from compressed_tensors.quantization.quant_args import FP8_E4M3_DATA, FP4_E2M1_DATA
-from compressed_tensors.quantization.utils import calculate_qparams, generate_gparam
+from compressed_tensors.quantization.utils import (
+    calculate_qparams,
+    generate_gparam,
+    scale_search_offset,
+)
 from compressed_tensors.registry.registry import RegistryMixin
 from compressed_tensors.utils import align_module_device
 
@@ -115,6 +119,17 @@ class Observer(InternalModule, RegistryMixin):
             quantization_args=self.args,
             global_scale=global_scale,
         )
+        # ScaleSearch (SYB): refine per-group scale by min block-MSE. `observed` is
+        # (num_observations, *qparam_shape, group_size); reshape to (*scales.shape,
+        # group_size) — weights have num_observations=1.
+        if getattr(self.args, "scale_search", False) and self.args.strategy in (
+            QuantizationStrategy.GROUP,
+            QuantizationStrategy.TENSOR_GROUP,
+        ):
+            x_blocks = observed.reshape(*scales.shape, observed.shape[-1])
+            scales = scale_search_offset(
+                x_blocks, scales, self.args, global_scale=global_scale
+            )
         return scales, zero_points, min_vals, max_vals
 
     def _get_global_scale_with_minmax(
